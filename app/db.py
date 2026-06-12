@@ -409,6 +409,19 @@ class DocStore:
             return DocRecord.from_row(row) if row else None
 
     @staticmethod
+    async def find_doc_ids_by_h3yun_ids(h3yun_object_ids: List[str]) -> List[str]:
+        """批量按氚云ObjectId查找对应的doc_id列表"""
+        if not h3yun_object_ids:
+            return []
+        p = pool()
+        async with p.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT doc_id FROM drawing_docs WHERE h3yun_object_id = ANY($1)",
+                h3yun_object_ids,
+            )
+            return [r["doc_id"] for r in rows]
+
+    @staticmethod
     async def get_meta_dict(doc_id: str) -> Dict[str, str]:
         info = await DocStore.get(doc_id)
         if not info:
@@ -462,27 +475,28 @@ class VectorStore:
     async def search(
         query_vec: np.ndarray,
         k: int = 10,
-        exclude_doc_id: Optional[str] = None,
+        exclude_doc_ids: Optional[List[str]] = None,
     ) -> List[dict]:
         """
         向量相似度搜索（余弦距离）
         返回 [{doc_id, page_index, similarity}, ...]
         对同一 doc_id 取最高相似度
+        exclude_doc_ids: 要排除的 doc_id 列表（按 h3yun_object_id 过滤自身）
         """
         p = pool()
         query_vec = np.ascontiguousarray(query_vec, dtype=np.float32)
 
         async with p.acquire() as conn:
-            if exclude_doc_id:
+            if exclude_doc_ids:
                 rows = await conn.fetch(
                     """
                     SELECT doc_id, page_index, 1 - (embedding <=> $1) AS similarity
                     FROM drawing_vectors
-                    WHERE doc_id != $2
+                    WHERE doc_id != ALL($2::varchar[])
                     ORDER BY embedding <=> $1
                     LIMIT $3
                     """,
-                    query_vec, exclude_doc_id, k * 5,
+                    query_vec, exclude_doc_ids, k * 5,
                 )
             else:
                 rows = await conn.fetch(
@@ -516,14 +530,15 @@ class VectorStore:
     async def multi_page_search(
         query_vectors: np.ndarray,
         k: int = 10,
-        exclude_doc_id: Optional[str] = None,
+        exclude_doc_ids: Optional[List[str]] = None,
     ) -> List[dict]:
         """
         多页查询：对每页向量搜索，合并结果取每个 doc_id 的最高相似度
+        exclude_doc_ids: 要排除的 doc_id 列表
         """
         merged: Dict[str, dict] = {}
         for qv in query_vectors:
-            hits = await VectorStore.search(qv, k=k * 2, exclude_doc_id=exclude_doc_id)
+            hits = await VectorStore.search(qv, k=k * 2, exclude_doc_ids=exclude_doc_ids)
             for hit in hits:
                 did = hit["doc_id"]
                 if did not in merged or hit["similarity"] > merged[did]["similarity"]:

@@ -296,6 +296,7 @@ async def import_record(h3yun_object_id: str, h3yun_schema_code: str = "",
 async def search_similar(
     file: UploadFile = File(..., description="待查询的 PDF"),
     top_k: int = Form(10, ge=1, le=50, description="返回最相似的前 N 个"),
+    exclude_object_ids: str = Form("", description="要排除的氚云ObjectId，逗号分隔（排除自身，避免搜到自己）"),
 ):
     """上传PDF查找相似图纸（BGE图文联合向量 + pgvector搜索）"""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -332,8 +333,15 @@ async def search_similar(
         [fe.extract(page.image, text=query_text[:2000]) for page in doc.pages], axis=0
     ).astype(np.float32)
 
+    # 解析 exclude_object_ids → 查 doc_ids
+    exclude_doc_ids = None
+    if exclude_object_ids.strip():
+        h3yun_ids = [x.strip() for x in exclude_object_ids.split(",") if x.strip()]
+        if h3yun_ids:
+            exclude_doc_ids = await DocStore.find_doc_ids_by_h3yun_ids(h3yun_ids)
+
     # pgvector 向量搜索（一次搞定，不再需要三段融合）
-    hits = await VectorStore.multi_page_search(query_vectors, k=top_k * 2)
+    hits = await VectorStore.multi_page_search(query_vectors, k=top_k * 2, exclude_doc_ids=exclude_doc_ids)
 
     # 去重 + 排序
     seen = set()
@@ -383,7 +391,7 @@ async def search_by_doc_id(doc_id: str, top_k: int = 10):
 
     # pgvector 向量搜索（排除自身）
     hits = await VectorStore.multi_page_search(
-        doc_vectors, k=top_k * 2, exclude_doc_id=doc_id
+        doc_vectors, k=top_k * 2, exclude_doc_ids=[doc_id]
     )
 
     seen = set()
