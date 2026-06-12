@@ -1,15 +1,11 @@
 """
-PDF 图纸相似性查找服务 — FastAPI 对外入口（pgvector 版）
+PDF 图纸相似性查找服务 — FastAPI 对外入口（BGE多模态版）
 
-与 v3.0 的区别：
-  - 移除 FAISS，向量存储和搜索全部由 pgvector 完成
-  - 直接对接 Supabase PostgreSQL
-  - 重启零成本，删除无需重建索引
-
-评分权重：
-  - 图像结构：70%
-  - OCR全文：20%
-  - 关键字段：10%
+与 v4.0 的区别：
+  - 特征提取从 pHash+HOG 升级为 Visualized-BGE 768维
+  - 图文联合编码：encode(image=图纸, text=OCR文本) → 768维统一向量
+  - 搜索简化：一次 pgvector 向量搜索搞定，不再需要三段融合评分
+  - 返回结果同时保留元数据（材料/工艺/公差等）供参考
 """
 from __future__ import annotations
 
@@ -38,13 +34,7 @@ from app.db import (
     close_pool,
     init_pool,
 )
-from app.feature_extractor import (
-    FeatureExtractor,
-    field_similarity,
-    fusion_score,
-    phash_hex,
-    text_similarity,
-)
+from app.feature_extractor import FeatureExtractor, cosine_similarity
 from app.pdf_reader import render_pdf
 from app.schemas import (
     DocInfoOut,
@@ -62,21 +52,22 @@ from app.schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时：初始化 PG 连接池 + pgvector 扩展
+    # 启动时：初始化 PG 连接池 + pgvector 扩展 + 预加载BGE模型
     await init_pool()
     vec_count = await VectorStore.count()
     doc_count = await DocStore.count()
-    print(f"[startup] pgvector 就绪，共 {doc_count} 文档 / {vec_count} 向量")
+    # 预加载BGE模型（避免第一次请求慢）
+    fe = FeatureExtractor()
+    print(f"[startup] pgvector 就绪，共 {doc_count} 文档 / {vec_count} 向量，特征维度 {fe.dim}")
     yield
-    # 关闭时
     await close_pool()
     print("[shutdown] 数据库连接已关闭")
 
 
 app = FastAPI(
-    title="PDF 图纸相似性查找 API (pgvector版)",
-    version="4.0.0",
-    description="基于视觉特征 + OCR + 工程关键字段的融合相似度检索（pgvector向量搜索）",
+    title="PDF 图纸相似性查找 API (BGE多模态版)",
+    version="5.0.0",
+    description="基于 Visualized-BGE 768维图文联合嵌入 + pgvector 向量搜索",
     lifespan=lifespan,
 )
 
@@ -85,8 +76,13 @@ app = FastAPI(
 # 依赖注入
 # =====================
 
+_fe_instance: Optional[FeatureExtractor] = None
+
 def extractor() -> FeatureExtractor:
-    return FeatureExtractor()
+    global _fe_instance
+    if _fe_instance is None:
+        _fe_instance = FeatureExtractor()
+    return _fe_instance
 
 
 # =====================
@@ -126,7 +122,7 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
 async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = True,
                       h3yun_object_id: str = "", h3yun_schema_code: str = ""):
     """
-    解析 PDF -> 提取图像/OCR/字段 -> 存 PG + pgvector
+    解析 PDF → 提取图像/OCR/字段 → BGE图文联合编码 → 存 PG + pgvector
     """
     t0 = time.time()
     try:
@@ -147,13 +143,6 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
     if existing:
         return existing, 0, time.time() - t0
 
-    # 提取图像特征（每页）
-    vectors = []
-    for page in doc.pages:
-        vectors.append(fe.extract_image(page.image))
-    vec_mat = np.stack(vectors, axis=0).astype(np.float32)
-    doc_id = DocRecord.new_id()
-
     # 提取文本信息
     direct_text = _extract_pdf_text(pdf_bytes)
     ocr_text = ""
@@ -173,6 +162,18 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
             ocr_used = True
 
     full_text = direct_text if not ocr_used else ocr_text
+
+    # BGE 图文联合编码（每页）
+    # 核心：encode(image=图纸页, text=OCR文本) → 768维统一向量
+    vectors = []
+    for page in doc.pages:
+        vec = fe.extract(page.image, text=full_text[:2000])  # 截断过长文本
+        vectors.append(vec)
+    vec_mat = np.stack(vectors, axis=0).astype(np.float32)
+
+    doc_id = DocRecord.new_id()
+
+    # 提取关键字段（元数据，不参与向量编码）
     fields = fe.extract_fields(full_text)
 
     info = DocRecord(
@@ -181,7 +182,7 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
         size_bytes=len(pdf_bytes),
         num_pages=doc.num_pages,
         created_at=time.time(),
-        phash=phash_hex(doc.pages[0].image),
+        phash=fe.file_signature(doc.pages[0])[:16] if doc.pages else "",
         signature=first_sig,
         ocr_text=full_text[:5000],
         text_source=text_source,
@@ -266,8 +267,8 @@ async def import_failed_list(limit: int = 100):
     """获取失败列表（可重试）"""
     items = await ImportStatusStore.get_failed(limit)
     return {"ok": True, "count": len(items), "items": [
-        {"h3yun_object_id": i.h3yun_object_id, "filename": i.filename, 
-         "status": i.status, "error": i.error_message}
+        {"h3yun_object_id": i.h3yun_object_id, "filename": i.filename,
+         "status": i.status, "error": i.error_message, "retry_count": i.retry_count}
         for i in items
     ]}
 
@@ -287,17 +288,16 @@ async def import_record(h3yun_object_id: str, h3yun_schema_code: str = "",
         error_message=error_message,
         attachment_info=attachment_info,
     )
-    return {"ok": True, "h3yun_object_id": result.h3yun_object_id, "status": result.status}
+    return {"ok": True, "h3yun_object_id": result.h3yun_object_id,
+            "status": result.status, "retry_count": result.retry_count}
 
 
 @app.post("/api/v1/search", response_model=SearchResponse, tags=["Search"])
 async def search_similar(
     file: UploadFile = File(..., description="待查询的 PDF"),
-    top_k: int = Form(5, ge=1, le=50, description="返回最相似的前 N 个"),
-    weight_image: float = Form(0.70, ge=0, le=1, description="图像权重"),
-    weight_text: float = Form(0.20, ge=0, le=1, description="文本权重"),
-    weight_field: float = Form(0.10, ge=0, le=1, description="字段权重"),
+    top_k: int = Form(10, ge=1, le=50, description="返回最相似的前 N 个"),
 ):
+    """上传PDF查找相似图纸（BGE图文联合向量 + pgvector搜索）"""
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件")
     raw = await file.read()
@@ -314,7 +314,7 @@ async def search_similar(
 
     fe = extractor()
 
-    # 提取文本和字段
+    # 提取文本
     direct_text = _extract_pdf_text(raw)
     if len(direct_text.strip()) < 30:
         ocr_texts = []
@@ -326,54 +326,51 @@ async def search_similar(
         query_text = "\n".join(ocr_texts) if ocr_texts else direct_text
     else:
         query_text = direct_text
-    query_fields = fe.extract_fields(query_text)
 
-    # 提取查询向量
+    # BGE 图文联合编码
     query_vectors = np.stack(
-        [fe.extract_image(page.image) for page in doc.pages], axis=0
+        [fe.extract(page.image, text=query_text[:2000]) for page in doc.pages], axis=0
     ).astype(np.float32)
 
-    # pgvector 多页搜索
-    hits = await VectorStore.multi_page_search(query_vectors, k=top_k * 3)
+    # pgvector 向量搜索（一次搞定，不再需要三段融合）
+    hits = await VectorStore.multi_page_search(query_vectors, k=top_k * 2)
 
-    # 计算融合评分
+    # 去重 + 排序
+    seen = set()
     results = []
     for hit in hits:
         did = hit["doc_id"]
-        image_sim = hit["similarity"]
+        if did in seen:
+            continue
+        seen.add(did)
         target_info = await DocStore.get(did)
         if not target_info:
             continue
-        t_sim = text_similarity(query_text, target_info.ocr_text or "")
-        f_sim = field_similarity(query_fields, await DocStore.get_meta_dict(did))
-        final_score = fusion_score(image_sim, t_sim, f_sim, weight_image, weight_text, weight_field)
         results.append({
             "doc_id": did,
-            "score": final_score,
-            "image_sim": image_sim,
-            "text_sim": t_sim,
-            "field_sim": f_sim,
+            "score": hit["similarity"],  # BGE向量余弦相似度即最终得分
             "meta": target_info,
         })
 
     results.sort(key=lambda x: -x["score"])
     final = []
     for i, r in enumerate(results[:top_k]):
+        meta = r["meta"]
         final.append(SearchResult(
             doc_id=r["doc_id"],
             score=round(r["score"], 4),
             rank=i + 1,
-            image_similarity=round(r["image_sim"], 4),
-            text_similarity=round(r["text_sim"], 4),
-            field_similarity=round(r["field_sim"], 4),
-            meta=_info_out(r["meta"]) if r["meta"] else None,
+            image_similarity=round(r["score"], 4),  # BGE统一向量，不再区分
+            text_similarity=None,  # 已融合在向量中
+            field_similarity=None,  # 已融合在向量中
+            meta=_info_out(meta) if meta else None,
         ))
 
     return SearchResponse(ok=True, query_doc_id=None, num_pages=doc.num_pages, results=final)
 
 
 @app.post("/api/v1/search/{doc_id}", response_model=SearchResponse, tags=["Search"])
-async def search_by_doc_id(doc_id: str, top_k: int = 5):
+async def search_by_doc_id(doc_id: str, top_k: int = 10):
     """根据库中已有文档 ID 查找相似图纸"""
     info = await DocStore.get(doc_id)
     if not info:
@@ -384,31 +381,24 @@ async def search_by_doc_id(doc_id: str, top_k: int = 5):
     if doc_vectors.size == 0:
         raise HTTPException(status_code=404, detail="该文档向量不在库中")
 
-    query_text = info.ocr_text or ""
-    query_fields = await DocStore.get_meta_dict(doc_id)
-
-    # pgvector 多页搜索（排除自身）
+    # pgvector 向量搜索（排除自身）
     hits = await VectorStore.multi_page_search(
-        doc_vectors, k=top_k * 3, exclude_doc_id=doc_id
+        doc_vectors, k=top_k * 2, exclude_doc_id=doc_id
     )
 
-    # 计算融合评分
+    seen = set()
     results = []
     for hit in hits:
         did = hit["doc_id"]
-        image_sim = hit["similarity"]
+        if did in seen:
+            continue
+        seen.add(did)
         target_info = await DocStore.get(did)
         if not target_info:
             continue
-        t_sim = text_similarity(query_text, target_info.ocr_text or "")
-        f_sim = field_similarity(query_fields, await DocStore.get_meta_dict(did))
-        final_score = fusion_score(image_sim, t_sim, f_sim)
         results.append({
             "doc_id": did,
-            "score": final_score,
-            "image_sim": image_sim,
-            "text_sim": t_sim,
-            "field_sim": f_sim,
+            "score": hit["similarity"],
             "meta": target_info,
         })
 
@@ -419,9 +409,9 @@ async def search_by_doc_id(doc_id: str, top_k: int = 5):
             doc_id=r["doc_id"],
             score=round(r["score"], 4),
             rank=i + 1,
-            image_similarity=round(r["image_sim"], 4),
-            text_similarity=round(r["text_sim"], 4),
-            field_similarity=round(r["field_sim"], 4),
+            image_similarity=round(r["score"], 4),
+            text_similarity=None,
+            field_similarity=None,
             meta=_info_out(r["meta"]) if r["meta"] else None,
         ))
 
@@ -459,11 +449,11 @@ async def delete_document(doc_id: str):
 @app.get("/", tags=["Root"])
 def root():
     return {
-        "name": "PDF Drawings Similarity API (pgvector版)",
-        "version": "4.0.0",
+        "name": "PDF Drawings Similarity API (BGE多模态版)",
+        "version": "5.0.0",
         "docs": "/docs",
-        "scoring_weights": {"image_structure": 0.70, "ocr_text": 0.20, "keyword_fields": 0.10},
-        "storage": "PostgreSQL + pgvector (向量搜索)",
+        "embedding": "Visualized-BGE 768维图文联合嵌入",
+        "storage": "PostgreSQL + pgvector",
         "endpoints": {
             "upload": "POST /api/v1/documents",
             "search_by_file": "POST /api/v1/search",

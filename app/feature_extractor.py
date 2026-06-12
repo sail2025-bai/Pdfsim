@@ -1,74 +1,75 @@
 """
-特征提取模块（融合版）
+特征提取模块（BGE多模态版）
 
 核心设计：
-  - 图像特征：pHash + 分块pHash + Sobel梯度直方图（无torch时）或 ResNet-50（有torch时）
-  - OCR文本：PaddleOCR（可选，无则用PDF原生文本）
-  - 关键词段：材料、工艺、表面处理、公差、尺寸等工程语义信息
+  - 图像+OCR文本 → Visualized-BGE 统一编码为 768维向量
+  - 图文联合嵌入：model.encode(image=图纸, text=OCR文本)
+  - 无需手工设计权重，向量空间自动对齐视觉和语义
 
-评分权重：
-  图像结构：70%
-  OCR全文：20%
-  关键字段：10%
+优势 vs 旧版(pHash+HOG)：
+  - 768维语义密集向量 vs 512维稀疏二值向量
+  - 一次向量搜索 vs 三段融合评分
+  - 深度语义理解 vs 浅层像素特征
 """
 from __future__ import annotations
 
 import hashlib
-import re
+import logging
+import os
 from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
 from PIL import Image
 
+logger = logging.getLogger(__name__)
+
+# ====================
+# Visualized-BGE 加载
+# ====================
+_BGE_MODEL = None
+
+def _get_bge_model():
+    """懒加载 Visualized-BGE 模型（首次调用时加载，之后复用）"""
+    global _BGE_MODEL
+    if _BGE_MODEL is not None:
+        return _BGE_MODEL
+
+    try:
+        from visual_bge.modeling import Visualized_BGE
+        from app.config import settings
+
+        model_name = settings.bge_model_name
+        model_weight = settings.bge_visual_weight or None
+
+        logger.info(f"Loading Visualized-BGE: {model_name}, weight={model_weight or 'auto-download'}")
+        _BGE_MODEL = Visualized_BGE(
+            model_name_bge=model_name,
+            model_weight=model_weight,
+        )
+        _BGE_MODEL.eval()
+        logger.info("Visualized-BGE loaded successfully (CPU mode)")
+        return _BGE_MODEL
+
+    except ImportError as e:
+        logger.error(f"visual_bge not installed: {e}")
+        logger.error("Install: pip install FlagEmbedding && install visual_bge submodule")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to load Visualized-BGE: {e}")
+        raise
+
+
+# ====================
+# OCR引擎（PaddleOCR，可选）
+# ====================
+_HAS_PADDLE = False
 try:
     from paddleocr import PaddleOCR
     _HAS_PADDLE = True
 except Exception:
     PaddleOCR = None
-    _HAS_PADDLE = False
 
-_HAS_TORCH = False
-try:
-    import torch
-    import torch.nn as nn
-    import torchvision.transforms as T
-    from torchvision import models as _tm
-    _HAS_TORCH = True
-    _torch_no_grad = torch.no_grad
-except Exception:
-    torch = None
-    nn = None
-    T = None
-    _tm = None
-    _torch_no_grad = None
-
-# ====================
-# 工程关键词配置
-# ====================
-MATERIAL_KEYWORDS = [
-    "SUS304", "SUS316", "316L", "304", "316",
-    "Q235", "Q345", "45#", "45钢", "40Cr",
-    "6061", "6063", "7075", "5052",
-    "铝合金", "不锈钢", "碳钢", "铜", "黄铜",
-    "POM", "尼龙", "ABS", "PC", "PP", "PE"
-]
-
-PROCESS_KEYWORDS = [
-    "车削", "铣削", "钻孔", "攻牙", "攻丝", "倒角", "去毛刺",
-    "线切割", "激光切割", "折弯", "焊接", "磨削",
-    "CNC", "加工中心", "数控车", "镗孔", "铰孔", "沉孔"
-]
-
-SURFACE_KEYWORDS = [
-    "阳极氧化", "硬质氧化", "发黑", "镀锌", "镀镍", "镀铬",
-    "喷砂", "喷涂", "烤漆", "抛光", "拉丝", "电泳",
-    "氧化", "表面处理", "钝化"
-]
-
-# ====================
-# OCR引擎
-# ====================
 _ocr_engine = None
 
 def get_ocr_engine():
@@ -79,8 +80,9 @@ def get_ocr_engine():
         _ocr_engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
     return _ocr_engine
 
+
 # ====================
-# 图像预处理（借鉴用户方案）
+# 图像预处理
 # ====================
 def _crop_border(gray):
     _, th = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
@@ -122,99 +124,46 @@ def _normalize_size(gray, max_side=1600):
         return gray
     return cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-def _preprocess_for_feature(img_arr):
-    """完整的图纸图像预处理流水线"""
+def preprocess_for_ocr(img_arr: np.ndarray) -> np.ndarray:
+    """预处理图纸图像（裁边+纠偏+归一化+增强+二值化）"""
     gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
     gray = _crop_border(gray)
     gray = _deskew(gray)
     gray = _normalize_size(gray)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 10)
+    binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 51, 10)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     return binary
 
-# ====================
-# pHash特征
-# ====================
-def phash_bits(pil_img: Image.Image, hash_size: int = 8) -> np.ndarray:
-    gray = pil_img.convert("L").resize((hash_size * 4, hash_size * 4), Image.LANCZOS)
-    arr = np.asarray(gray, dtype=np.float32)
-    dct = cv2.dct(arr)
-    dct_low = dct[:hash_size, :hash_size]
-    med = np.median(dct_low.flatten()[1:]) if dct_low.size > 1 else 0.0
-    return (dct_low > med).astype(np.float32).flatten()
-
-def phash_hex(pil_img: Image.Image, hash_size: int = 8) -> str:
-    bits = phash_bits(pil_img, hash_size)
-    n = int("".join(str(int(b)) for b in bits), 2)
-    width = hash_size * hash_size // 4
-    return f"{n:0{width}x}"
-
-def _subregion_phash(pil_img: Image.Image, grid: int = 3, hash_size: int = 6) -> np.ndarray:
-    w, h = pil_img.size
-    block_w, block_h = w // grid, h // grid
-    gray = pil_img.convert("L")
-    feats = []
-    for i in range(grid):
-        for j in range(grid):
-            region = gray.crop((j * block_w, i * block_h,
-                               (j + 1) * block_w if j < grid - 1 else w,
-                               (i + 1) * block_h if i < grid - 1 else h))
-            feats.append(phash_bits(region, hash_size=hash_size))
-    return np.concatenate(feats, axis=0)
-
-def _hog_features(pil_img: Image.Image, bins: int = 36) -> np.ndarray:
-    gray = np.asarray(pil_img.convert("L"), dtype=np.float32)
-    gray = cv2.resize(gray, (512, 512), interpolation=cv2.INTER_AREA)
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=5)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=5)
-    mag = np.sqrt(gx * gx + gy * gy)
-    ang = np.arctan2(gy, gx) * 180.0 / np.pi
-    mask = mag > (mag.mean() + 0.3 * mag.std())
-    sel_ang = ang[mask]
-    if sel_ang.size < 10:
-        return np.zeros(bins, dtype=np.float32)
-    h, _ = np.histogram(sel_ang, bins=bins, range=(-180, 180))
-    h = h.astype(np.float32)
-    h /= (np.linalg.norm(h) + 1e-6)
-    return h
 
 # ====================
-# 深度特征（可选）
+# 工程关键词提取（保留用于元数据字段，不参与向量）
 # ====================
-class _DeepFeatureExtractor:
-    def __init__(self, deep_dim: int = 256):
-        weights = _tm.ResNet50_Weights.IMAGENET1K_V2
-        backbone = _tm.resnet50(weights=weights)
-        self.features = nn.Sequential(
-            backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
-            backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4,
-            nn.AdaptiveAvgPool2d(1), nn.Flatten(1),
-        )
-        self.proj = nn.Linear(2048, deep_dim)
-        nn.init.eye_(self.proj.weight[:, :deep_dim])
-        nn.init.zeros_(self.proj.bias)
-        self.features.eval()
-        self.proj.eval()
-        self.transform = T.Compose([
-            T.Resize((224, 224)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+MATERIAL_KEYWORDS = [
+    "SUS304", "SUS316", "316L", "304", "316",
+    "Q235", "Q345", "45#", "45钢", "40Cr",
+    "6061", "6063", "7075", "5052",
+    "铝合金", "不锈钢", "碳钢", "铜", "黄铜",
+    "POM", "尼龙", "ABS", "PC", "PP", "PE"
+]
 
-    def forward(self, pil_img: Image.Image) -> np.ndarray:
-        with _torch_no_grad():
-            x = self.transform(pil_img.convert("RGB")).unsqueeze(0)
-            feat = self.features(x)
-            feat = self.proj(feat)
-            feat = torch.nn.functional.normalize(feat, p=2, dim=1)
-            return feat.squeeze(0).cpu().numpy().astype(np.float32)
+PROCESS_KEYWORDS = [
+    "车削", "铣削", "钻孔", "攻牙", "攻丝", "倒角", "去毛刺",
+    "线切割", "激光切割", "折弯", "焊接", "磨削",
+    "CNC", "加工中心", "数控车", "镗孔", "铰孔", "沉孔"
+]
 
-# ====================
-# 关键词段提取
-# ====================
+SURFACE_KEYWORDS = [
+    "阳极氧化", "硬质氧化", "发黑", "镀锌", "镀镍", "镀铬",
+    "喷砂", "喷涂", "烤漆", "抛光", "拉丝", "电泳",
+    "氧化", "表面处理", "钝化"
+]
+
+import re
+
 def _find_keywords(text: str, keywords: list) -> List[str]:
     text = (text or "").replace(" ", "").upper()
     found = []
@@ -244,7 +193,7 @@ def _extract_dimensions(text: str) -> List[str]:
     return sorted(set(results))[:50]
 
 def extract_key_fields(text: str) -> Dict[str, str]:
-    """提取材料、工艺、表面处理、公差、尺寸等关键字段"""
+    """提取材料、工艺、表面处理、公差、尺寸等关键字段（元数据，非向量）"""
     return {
         "material": ",".join(_find_keywords(text, MATERIAL_KEYWORDS)),
         "process_text": ",".join(_find_keywords(text, PROCESS_KEYWORDS)),
@@ -253,106 +202,61 @@ def extract_key_fields(text: str) -> Dict[str, str]:
         "dimension_text": ",".join(_extract_dimensions(text))
     }
 
-# ====================
-# 文本相似度计算
-# ====================
-try:
-    from rapidfuzz import fuzz
-    def text_similarity(a: str, b: str) -> float:
-        if not a or not b:
-            return 0.0
-        return fuzz.token_set_ratio(a, b) / 100.0
-except Exception:
-    def text_similarity(a: str, b: str) -> float:
-        """fallback：简单的Jaccard相似度"""
-        if not a or not b:
-            return 0.0
-        set_a = set(a.split())
-        set_b = set(b.split())
-        if not set_a or not set_b:
-            return 0.0
-        return len(set_a & set_b) / len(set_a | set_b)
-
-def field_similarity(query_meta: dict, target_meta: dict) -> float:
-    """关键字段相似度（加权）"""
-    weights = {
-        "material": 0.35,
-        "process_text": 0.25,
-        "surface_text": 0.20,
-        "tolerance_text": 0.10,
-        "dimension_text": 0.10
-    }
-    total = 0.0
-    score = 0.0
-    for key, weight in weights.items():
-        q = query_meta.get(key, "")
-        t = target_meta.get(key, "")
-        if q:
-            total += weight
-            if t:
-                score += weight * text_similarity(q, t)
-    return score / total if total > 0 else 0.0
 
 # ====================
-# 统一提取器
+# 统一特征提取器（BGE版）
 # ====================
 class FeatureExtractor:
-    """融合视觉特征 + OCR + 关键词段的统一提取器"""
-    
+    """BGE多模态特征提取器
+
+    核心方法：
+    - extract(image, text) → 768维图文联合向量
+    - extract_image(image) → 768维纯图像向量
+    - extract_ocr(img_arr) → OCR文本
+    - extract_fields(text) → 工程关键字段
+    """
+
     def __init__(self):
-        self._deep = None
-        if _HAS_TORCH:
-            try:
-                self._deep = _DeepFeatureExtractor(deep_dim=256)
-            except Exception:
-                self._deep = None
-        
-        self._phash_grid = 3
-        self._phash_size = 6
-        self._edge_bins = 128
-        self._dim = 512
-    
+        self._dim = 768
+
     @property
     def dim(self) -> int:
         return self._dim
-    
+
+    def extract(self, pil_img: Image.Image, text: str = "") -> np.ndarray:
+        """提取图文联合嵌入向量（768维）
+
+        Args:
+            pil_img: 图纸图像
+            text: OCR提取的文本（可选，有则图文联合编码，无则纯图像编码）
+
+        Returns:
+            768维 float32 归一化向量
+        """
+        import torch
+        model = _get_bge_model()
+
+        with torch.no_grad():
+            if text and text.strip():
+                # 图文联合编码：同时捕捉视觉结构和文字语义
+                vec = model.encode(image=pil_img, text=text)
+            else:
+                # 纯图像编码
+                vec = model.encode(image=pil_img)
+
+        result = vec.cpu().numpy().flatten().astype(np.float32)
+        # 归一化（BGE输出通常已归一化，保险起见再归一化一次）
+        norm = np.linalg.norm(result)
+        if norm > 1e-6:
+            result /= norm
+        return result
+
     def extract_image(self, pil_img: Image.Image) -> np.ndarray:
-        """提取图像视觉特征（512维向量）"""
-        if self._deep is not None:
-            return self._extract_with_deep(pil_img)
-        return self._extract_traditional(pil_img)
-    
-    def _extract_traditional(self, pil_img: Image.Image) -> np.ndarray:
-        g_phash = phash_bits(pil_img, hash_size=8)  # 64
-        s_phash = _subregion_phash(pil_img, grid=3, hash_size=6)  # 324
-        edge = _hog_features(pil_img, bins=self._edge_bins)  # 128
-        
-        g_phash = g_phash / (np.linalg.norm(g_phash) + 1e-6)
-        s_phash = s_phash / (np.linalg.norm(s_phash) + 1e-6)
-        edge = edge / (np.linalg.norm(edge) + 1e-6)
-        
-        vec = np.concatenate([g_phash, s_phash, edge], axis=0).astype(np.float32)
-        vec = vec[:self._dim]
-        if vec.size < self._dim:
-            pad = np.zeros(self._dim - vec.size, dtype=np.float32)
-            vec = np.concatenate([vec, pad], axis=0)
-        vec /= (np.linalg.norm(vec) + 1e-6)
-        return vec
-    
-    def _extract_with_deep(self, pil_img: Image.Image) -> np.ndarray:
-        deep = self._deep.forward(pil_img)  # 256
-        g_phash = phash_bits(pil_img, hash_size=8)  # 64
-        edge = _hog_features(pil_img, bins=192)  # 192
-        
-        g_phash = g_phash / (np.linalg.norm(g_phash) + 1e-6)
-        edge = edge / (np.linalg.norm(edge) + 1e-6)
-        
-        vec = np.concatenate([deep, g_phash, edge], axis=0).astype(np.float32)
-        vec /= (np.linalg.norm(vec) + 1e-6)
-        return vec
-    
+        """纯图像嵌入（768维）"""
+        return self.extract(pil_img, text="")
+
     def extract_ocr(self, img_arr: np.ndarray) -> str:
-        """从图像提取OCR文本（若无PaddleOCR则返回空字符串）"""
+        """从图像提取OCR文本"""
         if not _HAS_PADDLE:
             return ""
         try:
@@ -372,11 +276,11 @@ class FeatureExtractor:
             return "\n".join(texts)
         except Exception:
             return ""
-    
+
     def extract_fields(self, text: str) -> Dict[str, str]:
         """从文本提取工程关键字段"""
         return extract_key_fields(text)
-    
+
     def file_signature(self, pil_img: Image.Image) -> str:
         """基于图像内容的稳定哈希（用于去重）"""
         small = pil_img.convert("RGB").resize((128, 128))
@@ -385,24 +289,10 @@ class FeatureExtractor:
 
 
 # ====================
-# 融合评分（图像70% + 文本20% + 字段10%）
+# 相似度计算（简化版，直接余弦相似度）
 # ====================
-def fusion_score(
-    image_sim: float,
-    text_sim: float,
-    field_sim: float,
-    weight_image: float = 0.70,
-    weight_text: float = 0.20,
-    weight_field: float = 0.10
-) -> float:
-    """计算融合相似度得分"""
-    return (
-        weight_image * image_sim +
-        weight_text * text_sim +
-        weight_field * field_sim
-    )
-
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """计算两个向量的余弦相似度"""
     a = np.asarray(a, dtype=np.float32).flatten()
     b = np.asarray(b, dtype=np.float32).flatten()
     a = a / (np.linalg.norm(a) + 1e-12)

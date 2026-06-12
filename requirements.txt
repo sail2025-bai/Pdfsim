@@ -9,4 +9,7 @@ scipy>=1.11.0
 opencv-python-headless>=4.8.0
 pgvector>=0.2.4
 asyncpg>=0.29.0
-scikit-image>=0.21.0
+# torch/torchvision/FlagEmbedding 由 Dockerfile 单独安装（CPU版）
+timm>=0.9.0
+einops>=0.7.0
+ftfy>=6.1.0

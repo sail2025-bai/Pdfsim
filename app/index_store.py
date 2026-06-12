@@ -1,24 +1,25 @@
 """
-索引存储（pgvector版）
+索引存储（pgvector版 - BGE 768维）
 
-本模块仅保留 VectorIndex 类作为 db.VectorStore 的轻量包装，
-兼容原有 API 调用方式。实际向量搜索全部由 pgvector SQL 完成。
+VectorIndex 是 db.VectorStore 的薄包装，保持接口兼容。
+实际向量搜索由 pgvector SQL ORDER BY embedding <=> $1 完成。
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 
 from app.db import VectorStore
+from app.config import settings
 
 
 class VectorIndex:
     """向量索引（pgvector 代理）"""
 
-    def __init__(self, dim: int = 512, **kwargs):
-        self.dim = dim
+    def __init__(self, dim: int = None, **kwargs):
+        self.dim = dim or settings.feature_dim  # 默认768
 
     async def add(self, doc_id: str, vectors: np.ndarray) -> List[int]:
         """添加文档向量"""
