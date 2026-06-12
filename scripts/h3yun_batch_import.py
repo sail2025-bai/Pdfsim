@@ -615,33 +615,54 @@ def phase_report(config: dict):
 # CLI
 # =====================
 
+def _load_config(config_path: str) -> dict:
+    """
+    加载配置：优先用 .env 里的 H3YUN_* 配置（持久化不丢失），
+    其次用 config.json 文件，最后用硬编码兜底。
+    """
+    # 先从 .env / app config 读
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from app.config import settings
+        h3 = settings.h3yun
+        if h3.engine_code and h3.product_schema_code:
+            return {
+                "pdfsim_url": f"http://127.0.0.1:8000",
+                "h3yun": {
+                    "engine_code": h3.engine_code,
+                    "engine_secret": h3.engine_secret,
+                    "base_url": h3.base_url,
+                    "product_schema_code": h3.product_schema_code,
+                },
+                "attachment_field_code": h3.attachment_field_code,
+                "name_field_code": h3.name_field_code,
+                "download_dir": "/tmp/pdfsim_downloads",
+            }
+    except Exception:
+        pass
+
+    # 其次从 config.json 读
+    cp = Path(config_path)
+    if cp.exists():
+        with open(cp) as f:
+            return json.load(f)
+
+    # 都没有，报错
+    print("[error] 没有可用配置！请任选其一：")
+    print("  1. 在 .env 文件中配置 H3YUN_ENGINE_CODE / H3YUN_PRODUCT_SCHEMA_CODE 等")
+    print("  2. 创建 config.json 文件")
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="氚云图纸批量入库（状态写自己PG，不碰氚云）")
     parser.add_argument("action", choices=["scan", "import", "report", "retry"],
                         help="scan=全量扫描, import=执行入库, report=查看报告, retry=重试失败")
-    parser.add_argument("--config", default="config.json", help="配置文件路径")
+    parser.add_argument("--config", default="config.json", help="配置文件路径（优先用.env）")
     parser.add_argument("--limit", type=int, default=0, help="限制处理数量（0=全部）")
     args = parser.parse_args()
 
-    config_path = Path(args.config)
-    if not config_path.exists():
-        print(f"[error] 配置文件不存在: {config_path}")
-        print("请创建 config.json，示例：")
-        print(json.dumps({
-            "pdfsim_url": "http://127.0.0.1:8000",
-            "h3yun": {
-                "engine_code": "your_engine_code",
-                "engine_secret": "your_engine_secret",
-                "product_schema_code": "D000886XXX",
-            },
-            "attachment_field_code": "F0000107",
-            "name_field_code": "Name",
-            "download_dir": "/tmp/pdfsim_downloads",
-        }, indent=2, ensure_ascii=False))
-        sys.exit(1)
-
-    with open(config_path) as f:
-        config = json.load(f)
+    config = _load_config(args.config)
 
     if args.action == "scan":
         phase_scan(config, limit=args.limit)

@@ -47,6 +47,9 @@ print('BGE model ready'); \
 COPY app ./app
 COPY scripts ./scripts
 
+# .env 配置文件模板（实际部署时通过 volume 挂载: -v /path/to/.env:/app/.env）
+COPY .env.example ./.env.example
+
 RUN mkdir -p /app/data/uploads /app/data/index /app/models
 
 EXPOSE 8000
