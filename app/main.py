@@ -1,21 +1,20 @@
 """
-PDF 图纸相似性查找服务 — FastAPI 对外入口（PG 持久化版）
+PDF 图纸相似性查找服务 — FastAPI 对外入口（pgvector 版）
+
+与 v3.0 的区别：
+  - 移除 FAISS，向量存储和搜索全部由 pgvector 完成
+  - 直接对接 Supabase PostgreSQL
+  - 重启零成本，删除无需重建索引
 
 评分权重：
   - 图像结构：70%
   - OCR全文：20%
   - 关键字段：10%
-
-数据存储：
-  - PostgreSQL：向量 + 元数据持久化（不怕重启）
-  - FAISS：内存运行时索引（查询用，启动时从 PG 加载）
 """
 from __future__ import annotations
 
-import asyncio
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -38,8 +37,7 @@ from app.feature_extractor import (
     phash_hex,
     text_similarity,
 )
-from app.index_store import VectorIndex
-from app.pdf_reader import render_pdf, thumbnail
+from app.pdf_reader import render_pdf
 from app.schemas import (
     DocInfoOut,
     HealthResponse,
@@ -49,8 +47,6 @@ from app.schemas import (
     UploadResponse,
 )
 
-_index: Optional[VectorIndex] = None
-
 
 # =====================
 # Lifespan（启动/关闭）
@@ -58,13 +54,11 @@ _index: Optional[VectorIndex] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时
+    # 启动时：初始化 PG 连接池 + pgvector 扩展
     await init_pool()
-    global _index
-    fe = FeatureExtractor()
-    _index = VectorIndex(dim=fe.dim)
-    await _index.load_from_pg()
-    print(f"[startup] FAISS 索引已从 PG 加载，共 {_index.count_vectors()} 个向量")
+    vec_count = await VectorStore.count()
+    doc_count = await DocStore.count()
+    print(f"[startup] pgvector 就绪，共 {doc_count} 文档 / {vec_count} 向量")
     yield
     # 关闭时
     await close_pool()
@@ -72,9 +66,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="PDF 图纸相似性查找 API (PG持久化版)",
-    version="3.0.0",
-    description="基于视觉特征 + OCR + 工程关键字段的融合相似度检索（向量存PostgreSQL）",
+    title="PDF 图纸相似性查找 API (pgvector版)",
+    version="4.0.0",
+    description="基于视觉特征 + OCR + 工程关键字段的融合相似度检索（pgvector向量搜索）",
     lifespan=lifespan,
 )
 
@@ -85,11 +79,6 @@ app = FastAPI(
 
 def extractor() -> FeatureExtractor:
     return FeatureExtractor()
-
-def index() -> VectorIndex:
-    if _index is None:
-        raise RuntimeError("索引未初始化")
-    return _index
 
 
 # =====================
@@ -128,7 +117,7 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
 
 async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = True):
     """
-    解析 PDF -> 提取图像/OCR/字段 -> 存 PG + 建 FAISS 索引
+    解析 PDF -> 提取图像/OCR/字段 -> 存 PG + pgvector
     """
     t0 = time.time()
     try:
@@ -140,8 +129,8 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
         raise HTTPException(status_code=400, detail="PDF 无可用页面")
 
     fe = extractor()
-    idx = index()
 
+    # 去重检测
     first_sig = fe.file_signature(doc.pages[0].image) if doc.pages else ""
     existing = await DocStore.find_by_signature(first_sig) if first_sig else None
     if existing and not allow_existing:
@@ -195,9 +184,9 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
         dimension_text=fields.get("dimension_text", ""),
     )
 
-    # 同步写 PG + FAISS
+    # 写 PG 元数据 + 向量
     await DocStore.add(info)
-    await idx.add(doc_id, vec_mat)
+    await VectorStore.add(doc_id, vec_mat)
 
     return info, len(vectors), time.time() - t0
 
@@ -208,11 +197,12 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
 
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["System"])
 async def health():
-    cnt = await DocStore.count()
+    doc_cnt = await DocStore.count()
+    vec_cnt = await VectorStore.count()
     return HealthResponse(
         ok=True,
-        docs=cnt,
-        vectors=index().count_vectors(),
+        docs=doc_cnt,
+        vectors=vec_cnt,
         feature_dim=extractor().dim,
     )
 
@@ -234,6 +224,12 @@ async def upload_document(
         ok=True, doc_id=info.doc_id, num_pages=info.num_pages,
         num_vectors=n_vec, message=f"入库耗时 {dt:.2f}s",
     )
+
+
+@app.post("/api/v1/documents/batch", tags=["Documents"])
+async def batch_upload_status():
+    """批量导入状态查询（占位，后续对接氚云图纸批量入库）"""
+    return {"ok": True, "message": "批量导入功能开发中"}
 
 
 @app.post("/api/v1/search", response_model=SearchResponse, tags=["Search"])
@@ -259,7 +255,6 @@ async def search_similar(
         raise HTTPException(status_code=400, detail="PDF 无可用页面")
 
     fe = extractor()
-    idx = index()
 
     # 提取文本和字段
     direct_text = _extract_pdf_text(raw)
@@ -275,30 +270,29 @@ async def search_similar(
         query_text = direct_text
     query_fields = fe.extract_fields(query_text)
 
-    # 多页检索，合并结果
-    merged: Dict[str, dict] = {}
-    for page in doc.pages:
-        qv = fe.extract_image(page.image)
-        hits = idx.search(qv, k=top_k * 3)
-        for hit in hits:
-            did = hit["doc_id"]
-            image_sim = hit["score"]
-            if did not in merged or image_sim > merged[did].get("image_sim", 0):
-                merged[did] = {"image_sim": image_sim}
+    # 提取查询向量
+    query_vectors = np.stack(
+        [fe.extract_image(page.image) for page in doc.pages], axis=0
+    ).astype(np.float32)
+
+    # pgvector 多页搜索
+    hits = await VectorStore.multi_page_search(query_vectors, k=top_k * 3)
 
     # 计算融合评分
     results = []
-    for did, data in merged.items():
+    for hit in hits:
+        did = hit["doc_id"]
+        image_sim = hit["similarity"]
         target_info = await DocStore.get(did)
         if not target_info:
             continue
         t_sim = text_similarity(query_text, target_info.ocr_text or "")
         f_sim = field_similarity(query_fields, await DocStore.get_meta_dict(did))
-        final_score = fusion_score(data["image_sim"], t_sim, f_sim, weight_image, weight_text, weight_field)
+        final_score = fusion_score(image_sim, t_sim, f_sim, weight_image, weight_text, weight_field)
         results.append({
             "doc_id": did,
             "score": final_score,
-            "image_sim": data["image_sim"],
+            "image_sim": image_sim,
             "text_sim": t_sim,
             "field_sim": f_sim,
             "meta": target_info,
@@ -322,49 +316,39 @@ async def search_similar(
 
 @app.post("/api/v1/search/{doc_id}", response_model=SearchResponse, tags=["Search"])
 async def search_by_doc_id(doc_id: str, top_k: int = 5):
-    """根据库中已有文档 ID 查找相似图纸（直接用已存向量，无需 PDF 文件）"""
+    """根据库中已有文档 ID 查找相似图纸"""
     info = await DocStore.get(doc_id)
     if not info:
         raise HTTPException(status_code=404, detail="doc_id 不存在")
 
-    idx = index()
-    # 从 FAISS 索引中取出该文档的向量（内存中已有）
-    fid_list = idx._doc2fids.get(doc_id, [])
-    if not fid_list:
-        raise HTTPException(status_code=404, detail="该文档向量不在索引中")
-
-    # 直接从 FAISS 索引中提取该文档的向量
-    import numpy as np
-    vecs = idx._index.reconstruct_n(min(fid_list), len(fid_list))
-    # 排序确保按 page_index 顺序
-    vecs = np.array([vecs[i] for i in sorted(range(len(fid_list)), key=lambda i: fid_list[i])])
+    # 从 PG 获取该文档的向量
+    doc_vectors = await VectorStore.get_for_doc(doc_id)
+    if doc_vectors.size == 0:
+        raise HTTPException(status_code=404, detail="该文档向量不在库中")
 
     query_text = info.ocr_text or ""
     query_fields = await DocStore.get_meta_dict(doc_id)
 
-    merged: Dict[str, dict] = {}
-    for v in vecs:
-        hits = idx.search(v, k=top_k * 3)
-        for hit in hits:
-            did = hit["doc_id"]
-            if did == doc_id:
-                continue
-            image_sim = hit["score"]
-            if did not in merged or image_sim > merged[did].get("image_sim", 0):
-                merged[did] = {"image_sim": image_sim}
+    # pgvector 多页搜索（排除自身）
+    hits = await VectorStore.multi_page_search(
+        doc_vectors, k=top_k * 3, exclude_doc_id=doc_id
+    )
 
+    # 计算融合评分
     results = []
-    for did, data in merged.items():
+    for hit in hits:
+        did = hit["doc_id"]
+        image_sim = hit["similarity"]
         target_info = await DocStore.get(did)
         if not target_info:
             continue
         t_sim = text_similarity(query_text, target_info.ocr_text or "")
         f_sim = field_similarity(query_fields, await DocStore.get_meta_dict(did))
-        final_score = fusion_score(data["image_sim"], t_sim, f_sim)
+        final_score = fusion_score(image_sim, t_sim, f_sim)
         results.append({
             "doc_id": did,
             "score": final_score,
-            "image_sim": data["image_sim"],
+            "image_sim": image_sim,
             "text_sim": t_sim,
             "field_sim": f_sim,
             "meta": target_info,
@@ -406,22 +390,22 @@ async def delete_document(doc_id: str):
     info = await DocStore.get(doc_id)
     if not info:
         raise HTTPException(status_code=404, detail="doc_id 不存在")
-    removed = await index().remove_doc(doc_id)
+    vec_removed = await VectorStore.remove(doc_id)
     await DocStore.remove(doc_id)
     return JSONResponse(
         status_code=200,
-        content={"ok": True, "doc_id": doc_id, "vectors_removed": removed},
+        content={"ok": True, "doc_id": doc_id, "vectors_removed": vec_removed},
     )
 
 
 @app.get("/", tags=["Root"])
 def root():
     return {
-        "name": "PDF Drawings Similarity API (PG持久化版)",
-        "version": "3.0.0",
+        "name": "PDF Drawings Similarity API (pgvector版)",
+        "version": "4.0.0",
         "docs": "/docs",
         "scoring_weights": {"image_structure": 0.70, "ocr_text": 0.20, "keyword_fields": 0.10},
-        "storage": "PostgreSQL (向量 + 元数据) + FAISS (内存索引)",
+        "storage": "PostgreSQL + pgvector (向量搜索)",
         "endpoints": {
             "upload": "POST /api/v1/documents",
             "search_by_file": "POST /api/v1/search",

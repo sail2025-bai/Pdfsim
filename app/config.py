@@ -1,4 +1,4 @@
-"""PDF 图纸相似性查找 - 配置管理"""
+"""PDF 图纸相似性查找 - 配置管理（pgvector版）"""
 from pathlib import Path
 from pydantic import BaseModel
 
@@ -10,13 +10,15 @@ INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class DatabaseConfig(BaseModel):
-    """PostgreSQL 数据库配置"""
+    """PostgreSQL / Supabase 数据库配置"""
     host: str = "localhost"
     port: int = 5432
     user: str = "postgres"
     password: str = ""
     database: str = "postgres"
     max_connections: int = 10
+    # Supabase 自托管时 PG 端口通常映射到 5432 或其他
+    schema: str = "public"
 
 
 class Settings(BaseModel):
@@ -27,9 +29,8 @@ class Settings(BaseModel):
     top_k: int = 5
     use_gpu: bool = False
     max_upload_mb: int = 50
-    # 文件保留策略：False 表示只保存向量索引和元数据
     save_files: bool = False
-    # 数据库配置（PostgreSQL）
+    # 数据库配置（Supabase PG）
     db: DatabaseConfig = DatabaseConfig()
 
 

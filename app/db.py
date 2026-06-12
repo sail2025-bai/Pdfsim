@@ -1,28 +1,27 @@
 """
-PostgreSQL 数据库存储层
+PostgreSQL + pgvector 数据库存储层
 
 设计：
   - drawing_docs 表：元数据（文件名、OCR文本、材料、工艺等）
-  - drawing_vectors 表：每页特征向量（bytea 格式）
-  - FAISS 内存索引：启动时从 PG 加载全量向量，重启不丢失
-
-向量存储格式：numpy.float32 序列化后的二进制
+  - drawing_vectors 表：每页特征向量（pgvector vector(512) 类型）
+  - 向量搜索直接用 pgvector 的 <=> 余弦距离操作符
+  - 无需 FAISS，重启零成本
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import struct
 import time
 import uuid
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import asyncpg
+import numpy as np
+from pgvector.asyncpg import register_vector
 
 from app.config import settings
+
 
 # =====================
 # 数据模型
@@ -101,25 +100,35 @@ _pool: Optional[asyncpg.Pool] = None
 
 
 async def init_pool():
-    """初始化连接池并创建表"""
+    """初始化连接池、注册 pgvector 扩展、创建表"""
     global _pool
     if _pool is not None:
         return _pool
 
     cfg = settings.db
+
+    async def _init_conn(conn):
+        """每个连接注册 pgvector 类型"""
+        await register_vector(conn)
+
     _pool = await asyncpg.create_pool(
-        host=cfg.get("host", "localhost"),
-        port=cfg.get("port", 5432),
-        user=cfg.get("user", "postgres"),
-        password=cfg.get("password", ""),
-        database=cfg.get("database", "postgres"),
+        host=cfg.host,
+        port=cfg.port,
+        user=cfg.user,
+        password=cfg.password,
+        database=cfg.database,
         min_size=2,
-        max_size=cfg.get("max_connections", 10),
+        max_size=cfg.max_connections,
+        init=_init_conn,
     )
 
     async with _pool.acquire() as conn:
-        # 创建扩展和表
-        await conn.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"")
+        # 启用 pgvector 扩展
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        # 启用 uuid-ossp
+        await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+
+        # 文档元数据表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS drawing_docs (
                 doc_id        VARCHAR(24) PRIMARY KEY,
@@ -140,17 +149,33 @@ async def init_pool():
                 extra         JSONB DEFAULT '{}'
             )
         """)
-        await conn.execute("""
+
+        # 向量表（pgvector vector 类型）
+        dim = settings.feature_dim
+        await conn.execute(f"""
             CREATE TABLE IF NOT EXISTS drawing_vectors (
-                doc_id     VARCHAR(24),
+                doc_id     VARCHAR(24) REFERENCES drawing_docs(doc_id) ON DELETE CASCADE,
                 page_index INTEGER,
-                vector     BYTEA NOT NULL,
+                embedding  vector({dim}) NOT NULL,
                 PRIMARY KEY (doc_id, page_index)
             )
         """)
+
+        # 索引
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vectors_doc_id ON drawing_vectors(doc_id)
         """)
+
+        # pgvector HNSW 索引（向量量大时加速查询）
+        # 先尝试创建，如果已存在则忽略
+        try:
+            await conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_vectors_embedding
+                ON drawing_vectors
+                USING hnsw (embedding vector_cosine_ops)
+            """)
+        except Exception:
+            pass  # 索引创建可能因数据量不足而失败，忽略
 
     return _pool
 
@@ -216,15 +241,12 @@ class DocStore:
 
     @staticmethod
     async def remove(doc_id: str) -> bool:
+        """删除文档（向量表通过 ON DELETE CASCADE 自动删除）"""
         p = pool()
         async with p.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    "DELETE FROM drawing_vectors WHERE doc_id=$1", doc_id
-                )
-                r = await conn.execute(
-                    "DELETE FROM drawing_docs WHERE doc_id=$1", doc_id
-                )
+            r = await conn.execute(
+                "DELETE FROM drawing_docs WHERE doc_id=$1", doc_id
+            )
             return r != "DELETE 0"
 
     @staticmethod
@@ -233,7 +255,7 @@ class DocStore:
         async with p.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM drawing_docs ORDER BY created_at DESC OFFSET $1 LIMIT $2",
-                skip, limit
+                skip, limit,
             )
             return [DocRecord.from_row(r) for r in rows]
 
@@ -249,7 +271,7 @@ class DocStore:
         p = pool()
         async with p.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM drawing_docs WHERE signature=$1", sig
+                "SELECT * FROM drawing_docs WHERE signature=$1 LIMIT 1", sig
             )
             return DocRecord.from_row(row) if row else None
 
@@ -268,101 +290,118 @@ class DocStore:
 
 
 # =====================
-# VectorStore: 向量 CRUD
+# VectorStore: pgvector 向量存储与检索
 # =====================
 
-def vec_to_bytes(v) -> bytes:
-    """numpy 数组 -> 二进制"""
-    return v.astype("<f").tobytes()
-
-
-def bytes_to_vec(b: bytes, dim: int) -> "np.ndarray":
-    """二进制 -> numpy 数组"""
-    import numpy as np
-    return np.frombuffer(b, dtype="<f").astype(np.float32)
-
-
 class VectorStore:
-    """
-    PostgreSQL 向量存储（bytea 格式）
-    负责持久化，不负责搜索（搜索走 FAISS 内存索引）
-    """
+    """pgvector 向量存储"""
 
     @staticmethod
-    async def add(doc_id: str, vectors) -> List[int]:
-        """
-        批量存入向量，返回 page_index 列表
-        vectors: (n, dim) numpy float32
-        """
-        import numpy as np
+    async def add(doc_id: str, vectors: np.ndarray) -> List[int]:
+        """插入一个文档的多页向量，返回 page_index 列表"""
+        p = pool()
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-        p = pool()
+        page_indices = []
         async with p.acquire() as conn:
-            async with conn.transaction():
-                for i, vec in enumerate(vectors):
-                    await conn.execute(
-                        """
-                        INSERT INTO drawing_vectors (doc_id, page_index, vector)
-                        VALUES ($1, $2, $3)
-                        ON CONFLICT (doc_id, page_index) DO UPDATE SET vector=EXCLUDED.vector
-                        """,
-                        doc_id, i, vec.tobytes()
-                    )
-            return list(range(len(vectors)))
-
-    @staticmethod
-    async def get_for_doc(doc_id: str) -> "np.ndarray":
-        """
-        获取某文档所有向量，按 page_index 顺序返回 (n, dim)
-        """
-        import numpy as np
-        p = pool()
-        async with p.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT page_index, vector FROM drawing_vectors "
-                "WHERE doc_id=$1 ORDER BY page_index",
-                doc_id
-            )
-            if not rows:
-                return np.zeros((0, 512), dtype=np.float32)
-            vecs = [bytes_to_vec(r["vector"], 512) for r in rows]
-            return np.stack(vecs, axis=0).astype(np.float32)
-
-    @staticmethod
-    async def get_all() -> tuple:
-        """
-        加载全量向量，返回 (vectors: np.ndarray, doc_ids: List[str], page_indices: List[int])
-        用于启动时重建 FAISS 索引。
-        """
-        import numpy as np
-        p = pool()
-        async with p.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT doc_id, page_index, vector FROM drawing_vectors ORDER BY doc_id, page_index"
-            )
-            if not rows:
-                return np.zeros((0, 512), dtype=np.float32), [], []
-            vectors = [bytes_to_vec(r["vector"], 512) for r in rows]
-            doc_ids = [r["doc_id"] for r in rows]
-            page_indices = [r["page_index"] for r in rows]
-            return np.stack(vectors, axis=0).astype(np.float32), doc_ids, page_indices
+            for i, vec in enumerate(vectors):
+                await conn.execute(
+                    """
+                    INSERT INTO drawing_vectors (doc_id, page_index, embedding)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (doc_id, page_index) DO UPDATE SET embedding = EXCLUDED.embedding
+                    """,
+                    doc_id, i, vec,
+                )
+                page_indices.append(i)
+        return page_indices
 
     @staticmethod
     async def remove(doc_id: str) -> int:
+        """删除文档的所有向量"""
         p = pool()
         async with p.acquire() as conn:
             r = await conn.execute(
                 "DELETE FROM drawing_vectors WHERE doc_id=$1", doc_id
             )
-            # 返回删除数量
-            if r == "DELETE 0":
-                return 0
-            cnt_row = await conn.fetchrow(
-                "SELECT count(*) as c FROM drawing_vectors WHERE doc_id=$1", doc_id
-            )
-            # 刚才已删除，所以直接返回 1（因为按主键删除）
-            # 实际上返回受影响行数更准确
-            return 1
+            # r = "DELETE N"
+            return int(r.split()[-1]) if r.startswith("DELETE") else 0
+
+    @staticmethod
+    async def search(
+        query_vec: np.ndarray,
+        k: int = 10,
+        exclude_doc_id: Optional[str] = None,
+    ) -> List[dict]:
+        """
+        向量相似度搜索（余弦距离）
+        返回 [{doc_id, page_index, similarity}, ...]
+        对同一 doc_id 取最高相似度
+        """
+        p = pool()
+        query_vec = np.ascontiguousarray(query_vec, dtype=np.float32)
+
+        async with p.acquire() as conn:
+            if exclude_doc_id:
+                rows = await conn.fetch(
+                    """
+                    SELECT doc_id, page_index, 1 - (embedding <=> $1) AS similarity
+                    FROM drawing_vectors
+                    WHERE doc_id != $2
+                    ORDER BY embedding <=> $1
+                    LIMIT $3
+                    """,
+                    query_vec, exclude_doc_id, k * 5,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT doc_id, page_index, 1 - (embedding <=> $1) AS similarity
+                    FROM drawing_vectors
+                    ORDER BY embedding <=> $1
+                    LIMIT $2
+                    """,
+                    query_vec, k * 5,
+                )
+
+        # 同一 doc_id 取最高相似度
+        best: Dict[str, dict] = {}
+        for row in rows:
+            did = row["doc_id"]
+            sim = float(row["similarity"])
+            if did not in best or sim > best[did]["similarity"]:
+                best[did] = {
+                    "doc_id": did,
+                    "page_index": row["page_index"],
+                    "similarity": sim,
+                }
+
+        # 按相似度排序
+        ranked = sorted(best.values(), key=lambda x: -x["similarity"])[:k]
+        for i, r in enumerate(ranked):
+            r["rank"] = i + 1
+        return ranked
+
+    @staticmethod
+    async def multi_page_search(
+        query_vectors: np.ndarray,
+        k: int = 10,
+        exclude_doc_id: Optional[str] = None,
+    ) -> List[dict]:
+        """
+        多页查询：对每页向量搜索，合并结果取每个 doc_id 的最高相似度
+        """
+        merged: Dict[str, dict] = {}
+        for qv in query_vectors:
+            hits = await VectorStore.search(qv, k=k * 2, exclude_doc_id=exclude_doc_id)
+            for hit in hits:
+                did = hit["doc_id"]
+                if did not in merged or hit["similarity"] > merged[did]["similarity"]:
+                    merged[did] = hit
+
+        ranked = sorted(merged.values(), key=lambda x: -x["similarity"])[:k]
+        for i, r in enumerate(ranked):
+            r["rank"] = i + 1
+        return ranked
 
     @staticmethod
     async def count() -> int:
@@ -370,3 +409,23 @@ class VectorStore:
         async with p.acquire() as conn:
             r = await conn.fetchrow("SELECT COUNT(*) as c FROM drawing_vectors")
             return int(r["c"])
+
+    @staticmethod
+    async def count_docs() -> int:
+        p = pool()
+        async with p.acquire() as conn:
+            r = await conn.fetchrow("SELECT COUNT(DISTINCT doc_id) as c FROM drawing_vectors")
+            return int(r["c"])
+
+    @staticmethod
+    async def get_for_doc(doc_id: str) -> np.ndarray:
+        """获取某文档的所有向量"""
+        p = pool()
+        async with p.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT embedding FROM drawing_vectors WHERE doc_id=$1 ORDER BY page_index",
+                doc_id,
+            )
+        if not rows:
+            return np.zeros((0, settings.feature_dim), dtype=np.float32)
+        return np.stack([np.array(r["embedding"], dtype=np.float32) for r in rows], axis=0)

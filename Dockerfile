@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1.4
 #
-# PDF 图纸相似性查找 API - Dockerfile
+# PDF 图纸相似性查找 API - pgvector版 (无需torch)
 #
-# 注意：torch 体积大，生产环境可改 cpu-only 版
+# 精简依赖：去掉 torch（2GB+），传统特征足以应对工程图纸
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -19,11 +19,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-# torch CPU-only 源（可选，显著减小镜像体积）
 RUN pip install --upgrade pip setuptools wheel \
- && pip install -r requirements.txt \
-        --extra-index-url https://download.pytorch.org/whl/cpu || \
-    pip install -r requirements.txt
+ && pip install -r requirements.txt
 
 COPY app ./app
 
