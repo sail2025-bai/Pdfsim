@@ -48,9 +48,9 @@ class H3YunConfig(BaseModel):
     engine_code: str = ""
     engine_secret: str = ""
     base_url: str = "https://www.h3yun.com"
-    product_schema_code: str = ""        # 产品表单编码
-    attachment_field_code: str = ""       # 附件字段编码
-    name_field_code: str = "Name"         # 标识字段编码（产品名称/编号）
+    product_schema_code: str = "Spngcvyjd6zifjq0ye59gikz70"    # 产品表单编码
+    attachment_field_code: str = "F0000052"                      # 附件字段编码
+    name_field_code: str = "F0000223"                             # 标识字段编码
 
 
 class Settings(BaseModel):
