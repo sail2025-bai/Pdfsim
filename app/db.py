@@ -106,6 +106,9 @@ IMPORT_INGESTING = "ingesting"   # 入库中
 IMPORT_DONE = "done"             # 已入库
 IMPORT_FAILED = "failed"         # 入库失败
 IMPORT_SKIP = "skipped"          # 跳过（非PDF等）
+IMPORT_DEAD = "dead"             # 重试耗尽，需人工介入
+
+MAX_RETRY = 3  # 最大重试次数
 
 
 @dataclass
@@ -119,6 +122,7 @@ class ImportStatus:
     status: str = IMPORT_PENDING
     error_message: str = ""
     attachment_info: str = ""
+    retry_count: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -133,6 +137,7 @@ class ImportStatus:
             status=row.get("status", IMPORT_PENDING),
             error_message=row.get("error_message", ""),
             attachment_info=row.get("attachment_info", ""),
+            retry_count=int(row.get("retry_count", 0)),
             created_at=float(row.get("created_at", 0)),
             updated_at=float(row.get("updated_at", 0)),
         )
@@ -220,6 +225,7 @@ async def init_pool():
                 status            VARCHAR(32) DEFAULT 'pending',
                 error_message     TEXT DEFAULT '',
                 attachment_info   VARCHAR(256) DEFAULT '',
+                retry_count       INTEGER DEFAULT 0,
                 created_at        DOUBLE PRECISION DEFAULT 0,
                 updated_at        DOUBLE PRECISION DEFAULT 0
             )
@@ -530,15 +536,30 @@ class ImportStatusStore:
         error_message: str = "",
         attachment_info: str = "",
     ) -> ImportStatus:
-        """插入或更新入库状态"""
+        """插入或更新入库状态（自动管理重试计数）"""
         p = pool()
         now = time.time()
         async with p.acquire() as conn:
+            # 先看当前记录
+            existing = await conn.fetchrow(
+                "SELECT retry_count FROM drawing_import_status WHERE h3yun_object_id=$1",
+                h3yun_object_id,
+            )
+            current_retry = int(existing["retry_count"]) if existing else 0
+
+            # 如果标记为 failed，累加 retry_count
+            new_retry = current_retry
+            actual_status = status
+            if status == IMPORT_FAILED:
+                new_retry = current_retry + 1
+                if new_retry >= MAX_RETRY:
+                    actual_status = IMPORT_DEAD  # 重试耗尽
+
             row = await conn.fetchrow("""
                 INSERT INTO drawing_import_status
                     (h3yun_object_id, h3yun_schema_code, doc_id, filename,
-                     status, error_message, attachment_info, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                     status, error_message, attachment_info, retry_count, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
                 ON CONFLICT (h3yun_object_id) DO UPDATE SET
                     h3yun_schema_code = EXCLUDED.h3yun_schema_code,
                     doc_id = EXCLUDED.doc_id,
@@ -546,11 +567,12 @@ class ImportStatusStore:
                     status = EXCLUDED.status,
                     error_message = EXCLUDED.error_message,
                     attachment_info = EXCLUDED.attachment_info,
+                    retry_count = EXCLUDED.retry_count,
                     updated_at = EXCLUDED.updated_at
                 RETURNING *
             """,
                 h3yun_object_id, h3yun_schema_code, doc_id, filename,
-                status, error_message, attachment_info, now,
+                actual_status, error_message, attachment_info, new_retry, now,
             )
             if not row:
                 row = await conn.fetchrow(

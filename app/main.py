@@ -32,6 +32,8 @@ from app.db import (
     IMPORT_DONE,
     IMPORT_FAILED,
     IMPORT_SKIP,
+    IMPORT_DEAD,
+    MAX_RETRY,
     VectorStore,
     close_pool,
     init_pool,

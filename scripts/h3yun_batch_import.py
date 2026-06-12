@@ -48,11 +48,14 @@ STATUS_DOWNLOAD_FAIL = "download_fail"  # 附件下载失败
 STATUS_PARSE_FAIL = "parse_fail"     # PDF解析失败（损坏等）
 STATUS_INGESTING = "ingesting"       # 正在入库
 STATUS_DONE = "done"                 # 已入库
-STATUS_FAILED = "failed"             # 入库失败（可重试）
+STATUS_FAILED = "failed"             # 入库失败（可重试，最多3次）
 STATUS_DUPLICATE = "duplicate"       # 重复图纸（已存在）
+STATUS_DEAD = "dead"                 # 重试耗尽，需人工介入
 
-# 不可重试的终态（需要人工干预）
-TERMINAL_STATUSES = {STATUS_NO_ATTACHMENT, STATUS_NON_PDF, STATUS_PARSE_FAIL}
+MAX_RETRY = 3
+
+# 终态（不再自动重试，需人工干预）
+TERMINAL_STATUSES = {STATUS_NO_ATTACHMENT, STATUS_NON_PDF, STATUS_PARSE_FAIL, STATUS_DEAD}
 # 可重试的状态
 RETRYABLE_STATUSES = {STATUS_PENDING, STATUS_DOWNLOAD_FAIL, STATUS_FAILED}
 
@@ -66,6 +69,7 @@ STATUS_LABELS = {
     STATUS_DONE: "已入库",
     STATUS_FAILED: "入库失败",
     STATUS_DUPLICATE: "重复图纸",
+    STATUS_DEAD: "重试耗尽",
 }
 
 
@@ -583,7 +587,7 @@ def phase_report(config: dict):
 
     for status in [STATUS_DONE, STATUS_PENDING, STATUS_INGESTING,
                    STATUS_NO_ATTACHMENT, STATUS_NON_PDF, STATUS_PARSE_FAIL,
-                   STATUS_DOWNLOAD_FAIL, STATUS_FAILED, STATUS_DUPLICATE]:
+                   STATUS_DOWNLOAD_FAIL, STATUS_FAILED, STATUS_DEAD, STATUS_DUPLICATE]:
         count = by_status.get(status, 0)
         if count > 0:
             label = STATUS_LABELS.get(status, status)
