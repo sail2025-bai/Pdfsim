@@ -1,0 +1,16 @@
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+PyMuPDF>=1.23.7
+Pillow>=10.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+opencv-python-headless>=4.8.0
+pgvector>=0.2.4
+asyncpg>=0.29.0
+# torch/torchvision/FlagEmbedding 由 Dockerfile 单独安装（CPU版）
+timm>=0.9.0
+einops>=0.7.0
+ftfy>=6.1.0
+python-dotenv>=1.0.0
