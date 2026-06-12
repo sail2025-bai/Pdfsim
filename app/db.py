@@ -4,6 +4,7 @@ PostgreSQL + pgvector 数据库存储层
 设计：
   - drawing_docs 表：元数据（文件名、OCR文本、材料、工艺等）
   - drawing_vectors 表：每页特征向量（pgvector vector(512) 类型）
+  - drawing_import_status 表：图纸入库状态追踪（不侵入氚云原数据）
   - 向量搜索直接用 pgvector 的 <=> 余弦距离操作符
   - 无需 FAISS，重启零成本
 """
@@ -45,6 +46,9 @@ class DocRecord:
     tolerance_text: str = ""
     dimension_text: str = ""
     extra: dict = field(default_factory=dict)
+    # 氚云关联
+    h3yun_object_id: str = ""
+    h3yun_schema_code: str = ""
 
     @staticmethod
     def new_id() -> str:
@@ -68,6 +72,8 @@ class DocRecord:
             "tolerance_text": self.tolerance_text,
             "dimension_text": self.dimension_text,
             "extra": self.extra,
+            "h3yun_object_id": self.h3yun_object_id,
+            "h3yun_schema_code": self.h3yun_schema_code,
         }
 
     @classmethod
@@ -89,6 +95,46 @@ class DocRecord:
             tolerance_text=row.get("tolerance_text", ""),
             dimension_text=row.get("dimension_text", ""),
             extra=json.loads(row["extra"]) if row.get("extra") else {},
+            h3yun_object_id=row.get("h3yun_object_id", ""),
+            h3yun_schema_code=row.get("h3yun_schema_code", ""),
+        )
+
+
+# 入库状态枚举
+IMPORT_PENDING = "pending"       # 待入库
+IMPORT_INGESTING = "ingesting"   # 入库中
+IMPORT_DONE = "done"             # 已入库
+IMPORT_FAILED = "failed"         # 入库失败
+IMPORT_SKIP = "skipped"          # 跳过（非PDF等）
+
+
+@dataclass
+class ImportStatus:
+    """图纸入库状态记录"""
+    id: int = 0
+    h3yun_object_id: str = ""
+    h3yun_schema_code: str = ""
+    doc_id: str = ""
+    filename: str = ""
+    status: str = IMPORT_PENDING
+    error_message: str = ""
+    attachment_info: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+    @classmethod
+    def from_row(cls, row) -> "ImportStatus":
+        return cls(
+            id=int(row.get("id", 0)),
+            h3yun_object_id=row.get("h3yun_object_id", ""),
+            h3yun_schema_code=row.get("h3yun_schema_code", ""),
+            doc_id=row.get("doc_id", ""),
+            filename=row.get("filename", ""),
+            status=row.get("status", IMPORT_PENDING),
+            error_message=row.get("error_message", ""),
+            attachment_info=row.get("attachment_info", ""),
+            created_at=float(row.get("created_at", 0)),
+            updated_at=float(row.get("updated_at", 0)),
         )
 
 
@@ -131,22 +177,24 @@ async def init_pool():
         # 文档元数据表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS drawing_docs (
-                doc_id        VARCHAR(24) PRIMARY KEY,
-                filename      VARCHAR(512),
-                size_bytes    INTEGER DEFAULT 0,
-                num_pages     INTEGER DEFAULT 0,
-                created_at    DOUBLE PRECISION,
-                phash         VARCHAR(128),
-                signature     VARCHAR(128),
-                ocr_text      TEXT,
-                text_source   VARCHAR(32) DEFAULT 'pdf_text',
-                ocr_used      BOOLEAN DEFAULT FALSE,
-                material      VARCHAR(512),
-                process_text  VARCHAR(512),
-                surface_text  VARCHAR(512),
-                tolerance_text VARCHAR(512),
-                dimension_text VARCHAR(1024),
-                extra         JSONB DEFAULT '{}'
+                doc_id            VARCHAR(24) PRIMARY KEY,
+                filename          VARCHAR(512),
+                size_bytes        INTEGER DEFAULT 0,
+                num_pages         INTEGER DEFAULT 0,
+                created_at        DOUBLE PRECISION,
+                phash             VARCHAR(128),
+                signature         VARCHAR(128),
+                ocr_text          TEXT,
+                text_source       VARCHAR(32) DEFAULT 'pdf_text',
+                ocr_used          BOOLEAN DEFAULT FALSE,
+                material          VARCHAR(512),
+                process_text      VARCHAR(512),
+                surface_text      VARCHAR(512),
+                tolerance_text    VARCHAR(512),
+                dimension_text    VARCHAR(1024),
+                extra             JSONB DEFAULT '{}',
+                h3yun_object_id   VARCHAR(64) DEFAULT '',
+                h3yun_schema_code VARCHAR(64) DEFAULT ''
             )
         """)
 
@@ -161,13 +209,34 @@ async def init_pool():
             )
         """)
 
+        # 入库状态追踪表（不侵入氚云原数据）
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS drawing_import_status (
+                id                SERIAL PRIMARY KEY,
+                h3yun_object_id   VARCHAR(64) NOT NULL,
+                h3yun_schema_code VARCHAR(64) DEFAULT '',
+                doc_id            VARCHAR(24) DEFAULT '',
+                filename          VARCHAR(512) DEFAULT '',
+                status            VARCHAR(32) DEFAULT 'pending',
+                error_message     TEXT DEFAULT '',
+                attachment_info   VARCHAR(256) DEFAULT '',
+                created_at        DOUBLE PRECISION DEFAULT 0,
+                updated_at        DOUBLE PRECISION DEFAULT 0
+            )
+        """)
+
         # 索引
         await conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_vectors_doc_id ON drawing_vectors(doc_id)
         """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_import_h3yun ON drawing_import_status(h3yun_object_id)
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_import_status ON drawing_import_status(status)
+        """)
 
-        # pgvector HNSW 索引（向量量大时加速查询）
-        # 先尝试创建，如果已存在则忽略
+        # pgvector HNSW 索引
         try:
             await conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_vectors_embedding
@@ -175,7 +244,7 @@ async def init_pool():
                 USING hnsw (embedding vector_cosine_ops)
             """)
         except Exception:
-            pass  # 索引创建可能因数据量不足而失败，忽略
+            pass
 
     return _pool
 
@@ -208,8 +277,9 @@ class DocStore:
                 INSERT INTO drawing_docs
                 (doc_id, filename, size_bytes, num_pages, created_at,
                  phash, signature, ocr_text, text_source, ocr_used,
-                 material, process_text, surface_text, tolerance_text, dimension_text, extra)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                 material, process_text, surface_text, tolerance_text, dimension_text,
+                 extra, h3yun_object_id, h3yun_schema_code)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 ON CONFLICT (doc_id) DO UPDATE SET
                     filename=EXCLUDED.filename,
                     size_bytes=EXCLUDED.size_bytes,
@@ -220,13 +290,16 @@ class DocStore:
                     surface_text=EXCLUDED.surface_text,
                     tolerance_text=EXCLUDED.tolerance_text,
                     dimension_text=EXCLUDED.dimension_text,
-                    extra=EXCLUDED.extra
+                    extra=EXCLUDED.extra,
+                    h3yun_object_id=EXCLUDED.h3yun_object_id,
+                    h3yun_schema_code=EXCLUDED.h3yun_schema_code
             """,
                 info.doc_id, info.filename, info.size_bytes, info.num_pages,
                 info.created_at, info.phash, info.signature, info.ocr_text,
                 info.text_source, info.ocr_used, info.material, info.process_text,
                 info.surface_text, info.tolerance_text, info.dimension_text,
                 json.dumps(info.extra),
+                info.h3yun_object_id, info.h3yun_schema_code,
             )
         return info
 
@@ -272,6 +345,17 @@ class DocStore:
         async with p.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM drawing_docs WHERE signature=$1 LIMIT 1", sig
+            )
+            return DocRecord.from_row(row) if row else None
+
+    @staticmethod
+    async def find_by_h3yun_id(h3yun_object_id: str) -> Optional[DocRecord]:
+        """按氚云ObjectId查找已入库文档"""
+        p = pool()
+        async with p.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM drawing_docs WHERE h3yun_object_id=$1 LIMIT 1",
+                h3yun_object_id,
             )
             return DocRecord.from_row(row) if row else None
 
@@ -323,7 +407,6 @@ class VectorStore:
             r = await conn.execute(
                 "DELETE FROM drawing_vectors WHERE doc_id=$1", doc_id
             )
-            # r = "DELETE N"
             return int(r.split()[-1]) if r.startswith("DELETE") else 0
 
     @staticmethod
@@ -375,7 +458,6 @@ class VectorStore:
                     "similarity": sim,
                 }
 
-        # 按相似度排序
         ranked = sorted(best.values(), key=lambda x: -x["similarity"])[:k]
         for i, r in enumerate(ranked):
             r["rank"] = i + 1
@@ -429,3 +511,96 @@ class VectorStore:
         if not rows:
             return np.zeros((0, settings.feature_dim), dtype=np.float32)
         return np.stack([np.array(r["embedding"], dtype=np.float32) for r in rows], axis=0)
+
+
+# =====================
+# ImportStatusStore: 入库状态追踪（不侵入氚云原数据）
+# =====================
+
+class ImportStatusStore:
+    """入库状态追踪（存我们自己的PG，不碰氚云原数据）"""
+
+    @staticmethod
+    async def upsert(
+        h3yun_object_id: str,
+        h3yun_schema_code: str = "",
+        doc_id: str = "",
+        filename: str = "",
+        status: str = IMPORT_PENDING,
+        error_message: str = "",
+        attachment_info: str = "",
+    ) -> ImportStatus:
+        """插入或更新入库状态"""
+        p = pool()
+        now = time.time()
+        async with p.acquire() as conn:
+            row = await conn.fetchrow("""
+                INSERT INTO drawing_import_status
+                    (h3yun_object_id, h3yun_schema_code, doc_id, filename,
+                     status, error_message, attachment_info, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                ON CONFLICT (h3yun_object_id) DO UPDATE SET
+                    h3yun_schema_code = EXCLUDED.h3yun_schema_code,
+                    doc_id = EXCLUDED.doc_id,
+                    filename = EXCLUDED.filename,
+                    status = EXCLUDED.status,
+                    error_message = EXCLUDED.error_message,
+                    attachment_info = EXCLUDED.attachment_info,
+                    updated_at = EXCLUDED.updated_at
+                RETURNING *
+            """,
+                h3yun_object_id, h3yun_schema_code, doc_id, filename,
+                status, error_message, attachment_info, now,
+            )
+            if not row:
+                row = await conn.fetchrow(
+                    "SELECT * FROM drawing_import_status WHERE h3yun_object_id=$1",
+                    h3yun_object_id,
+                )
+            return ImportStatus.from_row(row) if row else ImportStatus()
+
+    @staticmethod
+    async def get(h3yun_object_id: str) -> Optional[ImportStatus]:
+        p = pool()
+        async with p.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM drawing_import_status WHERE h3yun_object_id=$1",
+                h3yun_object_id,
+            )
+            return ImportStatus.from_row(row) if row else None
+
+    @staticmethod
+    async def list_by_status(status: str, limit: int = 100) -> List[ImportStatus]:
+        p = pool()
+        async with p.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM drawing_import_status WHERE status=$1 ORDER BY created_at LIMIT $2",
+                status, limit,
+            )
+            return [ImportStatus.from_row(r) for r in rows]
+
+    @staticmethod
+    async def count_by_status() -> Dict[str, int]:
+        p = pool()
+        async with p.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT status, COUNT(*) as c FROM drawing_import_status GROUP BY status"
+            )
+            return {r["status"]: int(r["c"]) for r in rows}
+
+    @staticmethod
+    async def count() -> int:
+        p = pool()
+        async with p.acquire() as conn:
+            r = await conn.fetchrow("SELECT COUNT(*) as c FROM drawing_import_status")
+            return int(r["c"])
+
+    @staticmethod
+    async def get_pending(limit: int = 100) -> List[ImportStatus]:
+        """获取待入库列表"""
+        return await ImportStatusStore.list_by_status(IMPORT_PENDING, limit)
+
+    @staticmethod
+    async def get_failed(limit: int = 100) -> List[ImportStatus]:
+        """获取失败列表（可重试）"""
+        return await ImportStatusStore.list_by_status(IMPORT_FAILED, limit)

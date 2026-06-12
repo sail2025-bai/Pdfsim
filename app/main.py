@@ -26,6 +26,12 @@ from app.config import settings
 from app.db import (
     DocRecord,
     DocStore,
+    ImportStatusStore,
+    IMPORT_PENDING,
+    IMPORT_INGESTING,
+    IMPORT_DONE,
+    IMPORT_FAILED,
+    IMPORT_SKIP,
     VectorStore,
     close_pool,
     init_pool,
@@ -115,7 +121,8 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(texts)
 
 
-async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = True):
+async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = True,
+                      h3yun_object_id: str = "", h3yun_schema_code: str = ""):
     """
     解析 PDF -> 提取图像/OCR/字段 -> 存 PG + pgvector
     """
@@ -182,6 +189,8 @@ async def _ingest_pdf(pdf_bytes: bytes, filename: str, allow_existing: bool = Tr
         surface_text=fields.get("surface_text", ""),
         tolerance_text=fields.get("tolerance_text", ""),
         dimension_text=fields.get("dimension_text", ""),
+        h3yun_object_id=h3yun_object_id,
+        h3yun_schema_code=h3yun_schema_code,
     )
 
     # 写 PG 元数据 + 向量
@@ -211,6 +220,8 @@ async def health():
 async def upload_document(
     file: UploadFile = File(..., description="PDF 文件"),
     allow_existing: bool = Form(True, description="若已存在是否直接返回已有记录"),
+    h3yun_object_id: str = Form("", description="氚云ObjectId（批量入库时传入）"),
+    h3yun_schema_code: str = Form("", description="氚云SchemaCode"),
 ):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件")
@@ -219,17 +230,62 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="空文件")
     if len(raw) > settings.max_upload_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"文件过大，最大 {settings.max_upload_mb} MB")
-    info, n_vec, dt = await _ingest_pdf(raw, file.filename, allow_existing)
+    info, n_vec, dt = await _ingest_pdf(
+        raw, file.filename, allow_existing,
+        h3yun_object_id=h3yun_object_id,
+        h3yun_schema_code=h3yun_schema_code,
+    )
     return UploadResponse(
         ok=True, doc_id=info.doc_id, num_pages=info.num_pages,
         num_vectors=n_vec, message=f"入库耗时 {dt:.2f}s",
     )
 
 
-@app.post("/api/v1/documents/batch", tags=["Documents"])
-async def batch_upload_status():
-    """批量导入状态查询（占位，后续对接氚云图纸批量入库）"""
-    return {"ok": True, "message": "批量导入功能开发中"}
+@app.get("/api/v1/import/status", tags=["Import"])
+async def import_status_summary():
+    """入库状态汇总"""
+    counts = await ImportStatusStore.count_by_status()
+    total = await ImportStatusStore.count()
+    return {"ok": True, "total": total, "by_status": counts}
+
+
+@app.get("/api/v1/import/pending", tags=["Import"])
+async def import_pending_list(limit: int = 100):
+    """获取待入库列表"""
+    items = await ImportStatusStore.get_pending(limit)
+    return {"ok": True, "count": len(items), "items": [
+        {"h3yun_object_id": i.h3yun_object_id, "filename": i.filename, "status": i.status}
+        for i in items
+    ]}
+
+
+@app.get("/api/v1/import/failed", tags=["Import"])
+async def import_failed_list(limit: int = 100):
+    """获取失败列表（可重试）"""
+    items = await ImportStatusStore.get_failed(limit)
+    return {"ok": True, "count": len(items), "items": [
+        {"h3yun_object_id": i.h3yun_object_id, "filename": i.filename, 
+         "status": i.status, "error": i.error_message}
+        for i in items
+    ]}
+
+
+@app.post("/api/v1/import/record", tags=["Import"])
+async def import_record(h3yun_object_id: str, h3yun_schema_code: str = "",
+                        doc_id: str = "", filename: str = "",
+                        status: str = IMPORT_PENDING, error_message: str = "",
+                        attachment_info: str = ""):
+    """记录或更新入库状态（供批量脚本调用，不碰氚云原数据）"""
+    result = await ImportStatusStore.upsert(
+        h3yun_object_id=h3yun_object_id,
+        h3yun_schema_code=h3yun_schema_code,
+        doc_id=doc_id,
+        filename=filename,
+        status=status,
+        error_message=error_message,
+        attachment_info=attachment_info,
+    )
+    return {"ok": True, "h3yun_object_id": result.h3yun_object_id, "status": result.status}
 
 
 @app.post("/api/v1/search", response_model=SearchResponse, tags=["Search"])
