@@ -150,6 +150,43 @@ class ImportStatus:
 _pool: Optional[asyncpg.Pool] = None
 
 
+async def _check_vector_dim(conn) -> Optional[int]:
+    """检查 drawing_vectors 表的向量维度，不存在返回 None"""
+    try:
+        # 检查表是否存在
+        exists = await conn.fetchval("""
+            SELECT EXISTS(
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'drawing_vectors' AND table_schema = 'public'
+            )
+        """)
+        if not exists:
+            return None
+        # 从已有数据推断维度（最可靠）
+        sample = await conn.fetchrow(
+            "SELECT embedding FROM drawing_vectors LIMIT 1"
+        )
+        if sample:
+            return len(sample["embedding"])
+        # 表存在但无数据，从DDL解析
+        # pgvector 存维度在 typmod 中: dimension = (typmod - 4) / 4
+        # 参考: https://github.com/pgvector/pgvector/blob/master/src/vector.c
+        typmod = await conn.fetchval("""
+            SELECT a.atttypmod
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            WHERE c.relname = 'drawing_vectors' AND a.attname = 'embedding'
+        """)
+        if typmod and typmod > 0:
+            # pgvector typmod 编码: (dims << 16) | ndims，实际维度 = typmod >> 16
+            # 但更简单的计算: (typmod - VARHDRSZ) 直接就是维度
+            # VARHDRSZ = 4 for pgvector
+            return (typmod - 4) // 4
+        return None
+    except Exception:
+        return None
+
+
 async def init_pool():
     """初始化连接池、注册 pgvector 扩展、创建表"""
     global _pool
@@ -205,6 +242,12 @@ async def init_pool():
 
         # 向量表（pgvector vector 类型）
         dim = settings.feature_dim
+        # 检查已有表的向量维度，不一致则重建（512→768等升级场景）
+        existing_dim = await _check_vector_dim(conn)
+        if existing_dim is not None and existing_dim != dim:
+            print(f"[migration] drawing_vectors 维度 {existing_dim} → {dim}，重建表")
+            await conn.execute("DROP INDEX IF EXISTS idx_vectors_embedding")
+            await conn.execute("DROP TABLE drawing_vectors")
         await conn.execute(f"""
             CREATE TABLE IF NOT EXISTS drawing_vectors (
                 doc_id     VARCHAR(24) REFERENCES drawing_docs(doc_id) ON DELETE CASCADE,
